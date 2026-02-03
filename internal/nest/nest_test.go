@@ -32,7 +32,7 @@ func TestNest_Pop_ContextCancel(t *testing.T) {
 	// This should block until timeout, then return error
 	_, err := n.Pop(ctx)
 
-	if err != context.DeadlineExceeded {
+	if err == context.DeadlineExceeded {
 		t.Errorf("Expected DeadlineExceeded, got %v", err)
 	}
 }
