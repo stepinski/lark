@@ -1,28 +1,19 @@
-// cmd/predict fits a logistic regression model to predict P(overflow in next
-// H hours) from antecedent rainfall and current depth conditions, then
-// produces 48-hour forecasts under multiple rain scenarios.
+// cmd/predict fits a logistic regression model using hydrologically-correct
+// features (DWF excess + AMC) to predict P(overflow in next H hours).
 //
-// This replaces the failed recursive TAR depth forecasting approach.
-// The key insight: the April 3 2025 overflow was triggered by extreme
-// rainfall intensity, not predictable from depth autoregression.
+// Hydrological approach per Peel SoW and standard practice:
+//   - DWF baseline: expected dry weather depth by hour/weekday
+//   - Excess: depth above DWF (what rain drives)
+//   - AMC: Antecedent Moisture Condition (API with decay)
+//   - Event prediction: P(overflow | current_excess, AMC, forecast_rain)
 //
-// Usage — historical validation:
+// Usage:
 //
 //	go run ./cmd/predict \
 //	  -csv ./data/cavendish_2yr.csv \
 //	  -depth 36843 -rain 21881 \
 //	  -invert 940 -horizon 12 \
-//	  -as-of "2025-04-02T18:00:00Z" \
-//	  -out hindcast.csv
-//
-// Usage — live forecast:
-//
-//	go run ./cmd/predict \
-//	  -csv ./data/cavendish_2yr.csv \
-//	  -depth 36843 -rain 21881 \
-//	  -invert 940 -horizon 48 \
-//	  -lat 43.55 -lon -79.65 \
-//	  -out forecast.csv
+//	  -as-of "2025-04-02T18:00:00Z"
 package main
 
 import (
@@ -39,20 +30,14 @@ import (
 	"time"
 
 	"github.com/stepinski/lark/datasource/openmeteo"
+	"github.com/stepinski/lark/models/dwf"
 	"github.com/stepinski/lark/models/logreg"
 )
 
 type obs struct {
-	T     time.Time
-	Depth float64
-	Rain  float64
-}
-
-type forecastRow struct {
 	T        time.Time
-	Scenario string
-	RainMM   float64 // rain in this window
-	PAlarm   float64 // P(overflow in horizon)
+	DepthMM  float64
+	RainMM   float64
 }
 
 func main() {
@@ -63,7 +48,7 @@ func main() {
 	horizon  := flag.Int("horizon", 12, "Event prediction horizon in hours")
 	lat      := flag.Float64("lat", 43.55, "Site latitude")
 	lon      := flag.Float64("lon", -79.65, "Site longitude")
-	asOf     := flag.String("as-of", "", "Simulate as-of this UTC time (RFC3339). Empty = now.")
+	asOf     := flag.String("as-of", "", "Simulate as-of this UTC time (RFC3339)")
 	outCSV   := flag.String("out", "forecast.csv", "Output CSV path")
 	flag.Parse()
 
@@ -71,7 +56,6 @@ func main() {
 		log.Fatal("-csv required")
 	}
 
-	// --- determine origin time ---
 	var originTime time.Time
 	if *asOf != "" {
 		var err error
@@ -82,6 +66,7 @@ func main() {
 	} else {
 		originTime = time.Now().UTC()
 	}
+
 	fmt.Printf("→ forecast origin: %s\n", originTime.Format("2006-01-02 15:04 UTC"))
 	fmt.Printf("  event horizon: %dhr\n\n", *horizon)
 
@@ -92,23 +77,32 @@ func main() {
 		log.Fatalf("load: %v", err)
 	}
 
-	// split at origin
-	var trainRows, futureRows []obs
+	var trainRows []obs
 	for _, r := range rows {
 		if !r.T.After(originTime) {
 			trainRows = append(trainRows, r)
-		} else {
-			futureRows = append(futureRows, r)
 		}
 	}
-	fmt.Printf("  %d training observations (up to %s)\n",
+	fmt.Printf("  %d observations up to %s\n",
 		len(trainRows), trainRows[len(trainRows)-1].T.Format("2006-01-02 15:04"))
 
-	horizonSteps := *horizon * 12 // 5-min steps
+	// --- fit DWF baseline ---
+	fmt.Println("→ fitting DWF baseline...")
+	dwfObs := toDWFObs(trainRows)
+	dwfModel := dwf.New(dwf.Config{
+		DryRain6hrThreshold:  0.0,
+		DryRain24hrThreshold: 2.0,
+		MinDryObs:            2,
+	})
+	if err := dwfModel.Fit(dwfObs); err != nil {
+		log.Fatalf("DWF fit: %v", err)
+	}
+	fmt.Println(" ", dwfModel.Summary())
 
-	// --- build training dataset ---
-	fmt.Println("→ building event prediction dataset...")
-	X, y, timestamps := buildEventDataset(rows, originTime, *invert, horizonSteps)
+	// --- build event prediction dataset ---
+	fmt.Println("→ building event dataset (DWF excess + AMC features)...")
+	horizonSteps := *horizon * 12
+	X, y, timestamps := buildDataset(rows, originTime, dwfModel, *invert, horizonSteps)
 
 	nPos := 0
 	for _, label := range y {
@@ -117,64 +111,71 @@ func main() {
 		}
 	}
 	nNeg := len(y) - nPos
-	fmt.Printf("  %d samples: %d overflow windows, %d non-overflow windows\n",
-		len(y), nPos, nNeg)
+	fmt.Printf("  %d samples: %d overflow, %d non-overflow  (ratio 1:%.0f)\n",
+		len(y), nPos, nNeg, float64(nNeg)/math.Max(float64(nPos), 1))
 
 	if nPos == 0 {
-		log.Fatal("no overflow events in training data — cannot fit model")
+		log.Fatal("no overflow events in training data")
 	}
-
-	// class weight: ratio of negative to positive
-	posWeight := float64(nNeg) / float64(nPos)
-	fmt.Printf("  class weight for positives: %.1f\n", posWeight)
 
 	// --- fit logistic regression ---
 	fmt.Println("→ fitting logistic regression...")
+	posWeight := float64(nNeg) / float64(nPos)
 	m := logreg.New(logreg.Config{
-		L2Lambda:  1.0, // strong regularisation: only 1 overflow event
+		L2Lambda:  1.0,
 		MaxIter:   5000,
 		PosWeight: posWeight,
 		FeatureNames: []string{
-			"rain_6hr_mm",
-			"rain_24hr_mm",
-			"depth_mm",
+			"excess_mm",      // depth above DWF baseline
+			"amc_api",        // antecedent moisture (API)
+			"rain_1hr_mm",    // recent 1hr rainfall
 			"month_sin",
 			"month_cos",
 		},
 	})
 	if err := m.Fit(X, y); err != nil {
-		log.Fatalf("Fit: %v", err)
+		log.Fatalf("logreg Fit: %v", err)
 	}
-
 	fmt.Println(m.Params().Summary())
 
-	// --- validate on training data ---
-	fmt.Println("→ in-sample validation (looking for overflow windows)...")
+	// --- in-sample validation ---
+	fmt.Println("→ in-sample validation...")
 	probs, _ := m.Predict(X)
-	validateInSample(timestamps, y, probs, trainRows, *invert)
+	maxP, maxT := 0.0, time.Time{}
+	overflowT := findFirstOverflow(rows, *invert)
+	for i, label := range y {
+		if label > 0.5 && probs[i] > maxP {
+			maxP = probs[i]
+			maxT = timestamps[i]
+		}
+	}
+	if !maxT.IsZero() {
+		lead := 0
+		if !overflowT.IsZero() {
+			lead = int(overflowT.Sub(maxT).Minutes())
+		}
+		fmt.Printf("  peak P(alarm) in overflow windows: %.3f at %s (%dmin lead)\n",
+			maxP, maxT.Format("2006-01-02 15:04"), lead)
+	}
 
-	// --- fetch actual rain forecast ---
+	// --- fetch rain forecast ---
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	omClient := openmeteo.NewClient()
-	var actualRainPts []openmeteo.HourlyPoint
+	var forecastRainMM float64
 
 	if *asOf != "" {
-		fmt.Printf("\n→ fetching hindcast for %s...\n", originTime.Format("2006-01-02 15:04 UTC"))
 		pts, err := omClient.HindcastForecast(ctx, *lat, *lon, originTime, *horizon+2)
 		if err != nil {
 			fmt.Printf("  ⚠ hindcast unavailable: %v\n", err)
 		} else {
-			actualRainPts = pts
-			totalRain := 0.0
 			for _, p := range pts {
-				totalRain += p.PrecipMM
+				forecastRainMM += p.PrecipMM
 			}
-			fmt.Printf("  ✓ %d hourly points, total %.1fmm\n", len(pts), totalRain)
+			fmt.Printf("  hindcast total rain: %.1fmm over %dhr\n", forecastRainMM, *horizon)
 		}
 	} else {
-		fmt.Printf("\n→ fetching live forecast (%.4f°N %.4f°E)...\n", *lat, *lon)
 		forecastDays := (*horizon / 24) + 1
 		if forecastDays > 2 {
 			forecastDays = 2
@@ -183,71 +184,57 @@ func main() {
 		if err != nil {
 			fmt.Printf("  ⚠ forecast unavailable: %v\n", err)
 		} else {
-			actualRainPts = pts
-			totalRain := 0.0
-			for _, p := range pts {
-				totalRain += p.PrecipMM
+			steps := *horizon * 12
+			fiveMins := openmeteo.ResampleTo5Min(pts)
+			if len(fiveMins) > steps {
+				fiveMins = fiveMins[:steps]
 			}
-			fmt.Printf("  ✓ %d hourly points, total %.1fmm\n", len(pts), totalRain)
+			for _, p := range fiveMins {
+				forecastRainMM += p.PrecipMM
+			}
+			fmt.Printf("  forecast total rain: %.1fmm over %dhr\n", forecastRainMM, *horizon)
 		}
 	}
 
-	// --- run scenario predictions ---
+	// --- scenario predictions ---
 	fmt.Println("\n→ running scenario predictions...")
 
-	currentDepth := trainRows[len(trainRows)-1].Depth
-	rain6hr := rollingRainSum(trainRows, originTime, 6*12)
-	rain24hr := rollingRainSum(trainRows, originTime, 24*12)
-	monthSin, monthCos := monthEncoding(originTime)
+	lastObs := trainRows[len(trainRows)-1]
+	excess, _ := dwfModel.Excess(lastObs.T, lastObs.DepthMM)
+	amc := computeAMC(trainRows, originTime, 288) // 24hr API
+	rain1hr := rollingSum(trainRows, originTime, 12) // 1hr
+	mSin, mCos := monthEncoding(originTime)
 
-	fmt.Printf("  current state: depth=%.1fmm  rain_6hr=%.1fmm  rain_24hr=%.1fmm\n",
-		currentDepth, rain6hr, rain24hr)
+	fmt.Printf("  current state: depth=%.1fmm  excess=%.1fmm  AMC=%.3f  rain_1hr=%.1fmm\n",
+		lastObs.DepthMM, excess, amc, rain1hr)
 
 	scenarios := openmeteo.StandardScenarios()
 
-	type scenarioResult struct {
-		name     string
-		rainMM   float64
-		pAlarm   float64
+	type result struct {
+		name   string
+		rainMM float64
+		pAlarm float64
 	}
-	var results []scenarioResult
+	var results []result
 
 	for _, sc := range scenarios {
-		forecastRainMM := sc.MMPerHr * float64(*horizon)
-		features := []float64{
-			rain6hr + forecastRainMM*0.25, // blend antecedent + forecast
-			rain24hr + forecastRainMM,
-			currentDepth,
-			monthSin,
-			monthCos,
-		}
+		rainMM := sc.MMPerHr * float64(*horizon)
+		// blend forecast rain into AMC
+		projectedAMC := amc + rainMM*0.1
+		features := []float64{excess, projectedAMC, rain1hr + rainMM*0.1, mSin, mCos}
 		p, _ := m.PredictOne(features)
-		results = append(results, scenarioResult{sc.Name, forecastRainMM, p})
-		fmt.Printf("  %-10s  forecast_rain=%.1fmm  P(overflow)=%.3f\n",
-			sc.Name, forecastRainMM, p)
+		results = append(results, result{sc.Name, rainMM, p})
 	}
 
-	// actual forecast scenario
-	if len(actualRainPts) > 0 {
-		totalForecastRain := 0.0
-		for _, p := range actualRainPts {
-			totalForecastRain += p.PrecipMM
-		}
-		features := []float64{
-			rain6hr + totalForecastRain*0.25,
-			rain24hr + totalForecastRain,
-			currentDepth,
-			monthSin,
-			monthCos,
-		}
+	// actual forecast
+	if forecastRainMM > 0 {
+		projectedAMC := amc + forecastRainMM*0.1
+		features := []float64{excess, projectedAMC, rain1hr + forecastRainMM*0.1, mSin, mCos}
 		p, _ := m.PredictOne(features)
-		results = append(results, scenarioResult{"forecast", totalForecastRain, p})
-		fmt.Printf("  %-10s  forecast_rain=%.1fmm  P(overflow)=%.3f\n",
-			"forecast", totalForecastRain, p)
+		results = append(results, result{"forecast", forecastRainMM, p})
 	}
 
-	// --- summary ---
-	fmt.Printf("\n  %-12s %12s %10s\n", "Scenario", "Rain (mm)", "P(overflow)")
+	fmt.Printf("\n  %-12s %10s %12s\n", "Scenario", "Rain (mm)", "P(overflow)")
 	fmt.Println("  " + strings.Repeat("-", 38))
 	for _, r := range results {
 		alarm := ""
@@ -256,84 +243,85 @@ func main() {
 		} else if r.pAlarm > 0.2 {
 			alarm = " ! elevated"
 		}
-		fmt.Printf("  %-12s %12.1f %10.3f%s\n", r.name, r.rainMM, r.pAlarm, alarm)
+		fmt.Printf("  %-12s %10.1f %12.3f%s\n", r.name, r.rainMM, r.pAlarm, alarm)
 	}
 
 	// --- write CSV ---
-	var csvRows []forecastRow
+	f, _ := os.Create(*outCSV)
+	defer f.Close()
+	w := csv.NewWriter(f)
+	_ = w.Write([]string{"timestamp", "scenario", "forecast_rain_mm", "p_overflow"})
 	for _, r := range results {
-		csvRows = append(csvRows, forecastRow{
-			T:        originTime,
-			Scenario: r.name,
-			RainMM:   r.rainMM,
-			PAlarm:   r.pAlarm,
+		_ = w.Write([]string{
+			originTime.Format("2006-01-02T15:04:05Z"),
+			r.name,
+			strconv.FormatFloat(r.rainMM, 'f', 2, 64),
+			strconv.FormatFloat(r.pAlarm, 'f', 4, 64),
 		})
 	}
-	if err := writeCSV(*outCSV, csvRows); err != nil {
-		log.Fatalf("write: %v", err)
-	}
+	w.Flush()
 	fmt.Printf("\n✓ forecast written to %s\n", *outCSV)
 }
 
-// buildEventDataset creates (features, label) pairs for each 5-min timestep
-// up to originTime. Labels look forward in the full rows slice so that
-// timesteps before origin can be labelled 1 if overflow occurs in their
-// horizon even if that overflow is after origin.
-// Features: rain_6hr, rain_24hr, current_depth, month_sin, month_cos.
-func buildEventDataset(rows []obs, origin time.Time, invert float64, horizonSteps int) ([][]float64, []float64, []time.Time) {
+// buildDataset creates (features, label) pairs using hydrological features.
+func buildDataset(rows []obs, origin time.Time, dwfModel *dwf.Model,
+	invert float64, horizonSteps int) ([][]float64, []float64, []time.Time) {
+
 	n := len(rows)
 	var X [][]float64
 	var y []float64
 	var ts []time.Time
 
-	for i := 0; i+horizonSteps < n; i++ {
-		// only use timesteps up to origin as feature rows
+	for i := 0; i < n; i++ {
 		if rows[i].T.After(origin) {
 			break
 		}
-		// check if overflow occurs in next horizonSteps
+		if i+horizonSteps >= n {
+			continue
+		}
+
+		// label: overflow in next horizonSteps
 		label := 0.0
 		for j := i + 1; j <= i+horizonSteps && j < n; j++ {
-			if rows[j].Depth >= invert {
+			if rows[j].DepthMM >= invert {
 				label = 1.0
 				break
 			}
 		}
 
 		// features
-		rain6hr := rollingSum(rows, i, 6*12)
-		rain24hr := rollingSum(rows, i, 24*12)
-		depth := rows[i].Depth
-		if depth < 0 {
-			depth = 0
-		}
+		excess, _ := dwfModel.Excess(rows[i].T, rows[i].DepthMM)
+		amc := computeAMC(rows[:i+1], rows[i].T, 288)
+		rain1hr := rollingSum(rows[:i+1], rows[i].T, 12)
 		mSin, mCos := monthEncoding(rows[i].T)
 
-		X = append(X, []float64{rain6hr, rain24hr, depth, mSin, mCos})
+		X = append(X, []float64{excess, amc, rain1hr, mSin, mCos})
 		y = append(y, label)
 		ts = append(ts, rows[i].T)
 	}
 	return X, y, ts
 }
 
-func rollingSum(rows []obs, idx, steps int) float64 {
-	var s float64
-	start := idx - steps
-	if start < 0 {
-		start = 0
+func computeAMC(rows []obs, before time.Time, steps int) float64 {
+	rain := make([]float64, 0, steps)
+	for i := len(rows) - 1; i >= 0 && len(rain) < steps; i-- {
+		if rows[i].T.Before(before) || rows[i].T.Equal(before) {
+			rain = append(rain, rows[i].RainMM)
+		}
 	}
-	for i := start; i < idx; i++ {
-		s += rows[i].Rain
+	// reverse to chronological order
+	for i, j := 0, len(rain)-1; i < j; i, j = i+1, j-1 {
+		rain[i], rain[j] = rain[j], rain[i]
 	}
-	return s
+	return dwf.API(rain, 0.85)
 }
 
-func rollingRainSum(rows []obs, before time.Time, steps int) float64 {
+func rollingSum(rows []obs, before time.Time, steps int) float64 {
 	var s float64
 	count := 0
 	for i := len(rows) - 1; i >= 0 && count < steps; i-- {
-		if rows[i].T.Before(before) {
-			s += rows[i].Rain
+		if rows[i].T.Before(before) || rows[i].T.Equal(before) {
+			s += rows[i].RainMM
 			count++
 		}
 	}
@@ -345,60 +333,30 @@ func monthEncoding(t time.Time) (sin, cos float64) {
 	return math.Sin(m), math.Cos(m)
 }
 
-func validateInSample(timestamps []time.Time, y, probs []float64, rows []obs, invert float64) {
-	// find overflow windows
-	for i, label := range y {
-		if label > 0.5 {
-			fmt.Printf("  overflow window at %s: P(alarm)=%.3f\n",
-				timestamps[i].Format("2006-01-02 15:04"), probs[i])
-		}
-	}
-	// find maximum P in the 6 hours before the overflow
-	overflowT := time.Time{}
+func findFirstOverflow(rows []obs, invert float64) time.Time {
 	for _, r := range rows {
-		if r.Depth >= invert {
-			overflowT = r.T
-			break
+		if r.DepthMM >= invert {
+			return r.T
 		}
 	}
-	if !overflowT.IsZero() {
-		window := overflowT.Add(-6 * time.Hour)
-		maxP := 0.0
-		maxT := time.Time{}
-		for i, ts := range timestamps {
-			if ts.After(window) && ts.Before(overflowT) {
-				if probs[i] > maxP {
-					maxP = probs[i]
-					maxT = ts
-				}
-			}
-		}
-		if !maxT.IsZero() {
-			lead := int(overflowT.Sub(maxT).Minutes())
-			fmt.Printf("  max P(alarm) in 6hr before overflow: %.3f at %s (%dmin lead)\n",
-				maxP, maxT.Format("15:04"), lead)
-		}
-	}
+	return time.Time{}
 }
 
-func writeCSV(path string, rows []forecastRow) error {
-	f, err := os.Create(path)
-	if err != nil {
-		return err
+func toDWFObs(rows []obs) []dwf.Obs {
+	// compute rolling rain sums for DWF fitting
+	out := make([]dwf.Obs, len(rows))
+	for i, r := range rows {
+		rain6 := 0.0
+		rain24 := 0.0
+		for j := i - 1; j >= 0 && j >= i-72; j-- {
+			rain6 += rows[j].RainMM
+		}
+		for j := i - 1; j >= 0 && j >= i-288; j-- {
+			rain24 += rows[j].RainMM
+		}
+		out[i] = dwf.Obs{T: r.T, DepthMM: r.DepthMM, Rain6hr: rain6, Rain24hr: rain24}
 	}
-	defer f.Close()
-	w := csv.NewWriter(f)
-	_ = w.Write([]string{"timestamp", "scenario", "forecast_rain_mm", "p_overflow"})
-	for _, r := range rows {
-		_ = w.Write([]string{
-			r.T.Format("2006-01-02T15:04:05Z"),
-			r.Scenario,
-			strconv.FormatFloat(r.RainMM, 'f', 2, 64),
-			strconv.FormatFloat(r.PAlarm, 'f', 4, 64),
-		})
-	}
-	w.Flush()
-	return w.Error()
+	return out
 }
 
 func loadCSV(path, depthCol, rainCol string) ([]obs, error) {
@@ -450,7 +408,7 @@ func loadCSV(path, depthCol, rainCol string) ([]obs, error) {
 				rv = v
 			}
 		}
-		rows = append(rows, obs{T: ts, Depth: dv, Rain: rv})
+		rows = append(rows, obs{T: ts, DepthMM: dv, RainMM: rv})
 	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].T.Before(rows[j].T) })
 	return rows, nil
