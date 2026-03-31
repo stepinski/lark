@@ -19,8 +19,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/http"
 	"math"
+	"net/http"
 	"net/url"
 	"strconv"
 	"sync"
@@ -28,8 +28,6 @@ import (
 )
 
 const (
-	// maxPointsPerRequest is the FlowWorks documented response size cap.
-	maxPointsPerRequest = 1_500_000
 	// tokenRefreshMargin is how early we refresh before expiry.
 	tokenRefreshMargin = 5 * time.Minute
 	// defaultTimeout for individual HTTP requests.
@@ -56,9 +54,9 @@ type tokenRequest struct {
 }
 
 type tokenResponse struct {
-	Token     string `json:"Token"`
-	IssuedAt  string `json:"IssuedAt"`
-	Expires   string `json:"Expires"`
+	Token    string `json:"Token"`
+	IssuedAt string `json:"IssuedAt"`
+	Expires  string `json:"Expires"`
 }
 
 // --- Domain types ---
@@ -76,22 +74,22 @@ type DataPoint struct {
 
 // Site is a FlowWorks monitoring site.
 type Site struct {
-	SiteID        int      `json:"Id"`
-	SiteName      string   `json:"Name"`
-	InternalName  string   `json:"InternalName"`
-	Longitude     string   `json:"Longitude"`
-	Latitude      string   `json:"Latitude"`
-	SiteTypes     []string `json:"SiteTypes"`
+	SiteID       int      `json:"Id"`
+	SiteName     string   `json:"Name"`
+	InternalName string   `json:"InternalName"`
+	Longitude    string   `json:"Longitude"`
+	Latitude     string   `json:"Latitude"`
+	SiteTypes    []string `json:"SiteTypes"`
 }
 
 // Channel is a data channel within a site.
 type Channel struct {
-	ChannelID          int    `json:"Id"`
-	ChannelName        string `json:"Name"`
-	Units              string `json:"Unit"`
-	ChannelType        string `json:"ChannelType"`
-	IsVisible          bool   `json:"IsVisible"`
-	IsRainfallEnabled  bool   `json:"IsRainfallEnabled"`
+	ChannelID         int    `json:"Id"`
+	ChannelName       string `json:"Name"`
+	Units             string `json:"Unit"`
+	ChannelType       string `json:"ChannelType"`
+	IsVisible         bool   `json:"IsVisible"`
+	IsRainfallEnabled bool   `json:"IsRainfallEnabled"`
 }
 
 // --- Query options ---
@@ -464,8 +462,6 @@ func parseFlexDate(s string) (time.Time, error) {
 	}
 	return time.Time{}, fmt.Errorf("unrecognised date format %q", s)
 }
-
-
 
 // parseExpiry parses the FlowWorks token expiry string.
 // The API returns "2006-01-02 15:04:05.000Z" (with Z suffix).
