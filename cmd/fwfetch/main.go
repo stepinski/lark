@@ -1,10 +1,16 @@
-// cmd/fwfetch is a quick CLI to verify FlowWorks connectivity and pull
-// the first 30 days of data from the two Peel sites.
+// cmd/fwfetch pulls time series data from a FlowWorks API endpoint.
 //
 // Usage:
 //
-//	go run ./cmd/fwfetch -user YOUR_USER -pass YOUR_PASS
-//	go run ./cmd/fwfetch -user YOUR_USER -pass YOUR_PASS -days 365
+//	go run ./cmd/fwfetch -user USER -pass PASS -site 241 -channels 36843,21881,36451
+//	go run ./cmd/fwfetch -user USER -pass PASS -site 241 -channels 36843 -days 365
+//	go run ./cmd/fwfetch -user USER -pass PASS -site 241 -channels 36843 -start 2022-01-01 -end 2024-01-01
+//
+// Credentials can also be provided via environment variables:
+//
+//	export FW_USER=your_username
+//	export FW_PASS=your_password
+//	go run ./cmd/fwfetch -site 241 -channels 36843,21881
 package main
 
 import (
@@ -14,89 +20,131 @@ import (
 	"log"
 	"math"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/stepinski/lark/datasource/flowworks"
 )
 
 func main() {
-	user := flag.String("user", os.Getenv("FW_USER"), "FlowWorks username (or set FW_USER env)")
-	pass := flag.String("pass", os.Getenv("FW_PASS"), "FlowWorks password (or set FW_PASS env)")
-	days := flag.Int("days", 30, "Number of days to fetch")
+	user := flag.String("user", os.Getenv("FW_USER"), "FlowWorks username (or FW_USER env)")
+	pass := flag.String("pass", os.Getenv("FW_PASS"), "FlowWorks password (or FW_PASS env)")
 	baseURL := flag.String("url", "https://developers.flowworks.com/fwapi/v2", "FlowWorks API base URL")
+	siteID := flag.Int("site", 0, "Site ID to fetch (required)")
+	channelList := flag.String("channels", "", "Comma-separated channel IDs, e.g. 36843,21881,36451 (required)")
+	days := flag.Int("days", 30, "Number of recent days to fetch (ignored if -start/-end provided)")
+	start := flag.String("start", "", "Start date: yyyy-MM-dd or yyyy-MM-ddTHH:mm:ss")
+	end := flag.String("end", "", "End date: yyyy-MM-dd or yyyy-MM-ddTHH:mm:ss")
+	listSites := flag.Bool("list-sites", false, "List all visible sites and exit")
+	listChannels := flag.Bool("list-channels", false, "List all channels for -site and exit")
 	flag.Parse()
 
 	if *user == "" || *pass == "" {
-		log.Fatal("credentials required: -user and -pass flags, or FW_USER / FW_PASS env vars")
+		log.Fatal("credentials required: -user / -pass flags or FW_USER / FW_PASS env vars")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
 	c := flowworks.NewClient(*baseURL, *user, *pass)
 
-	// --- verify connectivity ---
-	fmt.Println("→ authenticating...")
-	sites, err := c.Sites(ctx)
-	if err != nil {
-		log.Fatalf("sites error: %v", err)
-	}
-	fmt.Printf("✓ connected — %d sites visible\n\n", len(sites))
-
-	// --- known Peel sites ---
-	type siteSpec struct {
-		siteID    int
-		siteName  string
-		channels  map[string]int
-	}
-
-	peelSites := []siteSpec{
-		{
-			siteID:   241,
-			siteName: "Cavendish Cr (OVF)",
-			channels: map[string]int{
-				"Depth":    36843,
-				"Rainfall": 21881,
-				"Float":    36451,
-			},
-		},
-		{
-			siteID:   255,
-			siteName: "Clarkson GO Weir (OVF1)",
-			channels: map[string]int{
-				"Depth":    36930,
-				"Rainfall": 36503,
-				"Float":    36493,
-			},
-		},
-	}
-
-	opt := flowworks.LastN("D", *days)
-
-	for _, site := range peelSites {
-		fmt.Printf("=== Site %d: %s ===\n", site.siteID, site.siteName)
-
-		channelIDs := make([]int, 0, len(site.channels))
-		idToName := make(map[int]string)
-		for name, id := range site.channels {
-			channelIDs = append(channelIDs, id)
-			idToName[id] = name
-		}
-
-		data, err := c.MultiChannelData(ctx, site.siteID, channelIDs, opt)
+	// --- list sites mode ---
+	if *listSites {
+		sites, err := c.Sites(ctx)
 		if err != nil {
-			fmt.Printf("  ✗ error: %v\n\n", err)
+			log.Fatalf("sites error: %v", err)
+		}
+		fmt.Printf("%-8s %-40s %s\n", "ID", "Name", "Type")
+		fmt.Println(strings.Repeat("-", 70))
+		for _, s := range sites {
+			fmt.Printf("%-8d %-40s %s\n", s.SiteID, s.SiteName, s.SiteType)
+		}
+		return
+	}
+
+	// --- list channels mode ---
+	if *listChannels {
+		if *siteID == 0 {
+			log.Fatal("-site required with -list-channels")
+		}
+		channels, err := c.SiteChannels(ctx, *siteID)
+		if err != nil {
+			log.Fatalf("channels error: %v", err)
+		}
+		fmt.Printf("%-8s %-40s %s\n", "ID", "Name", "Units")
+		fmt.Println(strings.Repeat("-", 60))
+		for _, ch := range channels {
+			fmt.Printf("%-8d %-40s %s\n", ch.ChannelID, ch.ChannelName, ch.Units)
+		}
+		return
+	}
+
+	// --- data fetch mode ---
+	if *siteID == 0 {
+		log.Fatal("-site required")
+	}
+	if *channelList == "" {
+		log.Fatal("-channels required, e.g. -channels 36843,21881,36451")
+	}
+
+	channelIDs, err := parseChannelIDs(*channelList)
+	if err != nil {
+		log.Fatalf("invalid -channels value: %v", err)
+	}
+
+	var opt flowworks.QueryOption
+	if *start != "" {
+		opt = flowworks.DateRange(*start, *end)
+	} else {
+		opt = flowworks.LastN("D", *days)
+	}
+
+	fmt.Printf("→ fetching site %d, channels %v\n", *siteID, channelIDs)
+
+	data, err := c.MultiChannelData(ctx, *siteID, channelIDs, opt)
+	if err != nil {
+		log.Fatalf("fetch error: %v", err)
+	}
+
+	fmt.Printf("\n%-12s %-8s %-10s %-10s %-10s %-10s %s\n",
+		"Channel", "Points", "Min", "Max", "Mean", "NaN", "First timestamp")
+	fmt.Println(strings.Repeat("-", 75))
+
+	for _, id := range channelIDs {
+		pts, ok := data[id]
+		if !ok {
+			fmt.Printf("%-12d %-8s\n", id, "ERROR")
 			continue
 		}
-
-		for id, pts := range data {
-			name := idToName[id]
-			stats := computeStats(pts)
-			fmt.Printf("  %-10s (ch %d): %d points  min=%.3f  max=%.3f  mean=%.3f  nan=%d\n",
-				name, id, len(pts), stats.min, stats.max, stats.mean, stats.nanCount)
+		s := computeStats(pts)
+		first := ""
+		if len(pts) > 0 {
+			first = pts[0].Time.Format("2006-01-02 15:04")
 		}
-		fmt.Println()
+		fmt.Printf("%-12d %-8d %-10.3f %-10.3f %-10.3f %-10d %s\n",
+			id, len(pts), s.min, s.max, s.mean, s.nanCount, first)
 	}
+}
+
+func parseChannelIDs(s string) ([]int, error) {
+	parts := strings.Split(s, ",")
+	ids := make([]int, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		id, err := strconv.Atoi(p)
+		if err != nil {
+			return nil, fmt.Errorf("%q is not a valid channel ID", p)
+		}
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 {
+		return nil, fmt.Errorf("no valid channel IDs found in %q", s)
+	}
+	return ids, nil
 }
 
 type stats struct {
