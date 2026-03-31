@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stepinski/lark/datasource/flowworks"
+	"github.com/skete-io/lark/datasource/flowworks"
 )
 
 // --- test server helpers ---
@@ -294,19 +294,19 @@ func TestClient_SiteChannels(t *testing.T) {
 	defer ms.Close()
 	ms.handle("/authenticate", authHandler)
 
-	ms.handle("/sites/241/channels", func(w http.ResponseWriter, r *http.Request) {
+	ms.handle("/sites/1/channels", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]interface{}{
 			"Resources": []map[string]interface{}{
-				{"ChannelId": 36843, "ChannelName": "Depth",   "Units": "m"},
-				{"ChannelId": 21881, "ChannelName": "Rainfall", "Units": "mm"},
-				{"ChannelId": 36451, "ChannelName": "Float",   "Units": ""},
+				{"ChannelId": 1, "ChannelName": "Depth",    "Units": "m"},
+				{"ChannelId": 2, "ChannelName": "Rainfall", "Units": "mm"},
+				{"ChannelId": 3, "ChannelName": "Float",    "Units": ""},
 			},
 			"ResultCode": 0, "ResultMessage": "OK",
 		})
 	})
 
 	c := flowworks.NewClient(ms.URL(), "user", "pass")
-	channels, err := c.SiteChannels(context.Background(), 241)
+	channels, err := c.SiteChannels(context.Background(), 1)
 	if err != nil {
 		t.Fatalf("SiteChannels error: %v", err)
 	}
@@ -318,28 +318,27 @@ func TestClient_SiteChannels(t *testing.T) {
 	}
 }
 
-// TestClient_PeelSiteIDs verifies the two known Peel site+channel combos
-// are correctly routed. This acts as a regression test for the site/channel
-// IDs provided by the client.
-func TestClient_PeelSiteIDs(t *testing.T) {
-	peelSites := []struct {
+// TestClient_MultiSiteRouting verifies that requests are correctly routed
+// to different site/channel combinations.
+func TestClient_MultiSiteRouting(t *testing.T) {
+	combos := []struct {
 		siteID    int
 		channelID int
 		label     string
 	}{
-		{241, 36843, "Cavendish Depth"},
-		{241, 21881, "Cavendish Rainfall"},
-		{241, 36451, "Cavendish Float"},
-		{255, 36930, "Clarkson Depth"},
-		{255, 36503, "Clarkson Rainfall"},
-		{255, 36493, "Clarkson Float"},
+		{1, 10, "site1-depth"},
+		{1, 11, "site1-rainfall"},
+		{1, 12, "site1-switch"},
+		{2, 20, "site2-depth"},
+		{2, 21, "site2-rainfall"},
+		{2, 22, "site2-switch"},
 	}
 
 	ms := newMockServer()
 	defer ms.Close()
 	ms.handle("/authenticate", authHandler)
 
-	for _, s := range peelSites {
+	for _, s := range combos {
 		path := fmt.Sprintf("/sites/%d/channels/%d/data", s.siteID, s.channelID)
 		label := s.label
 		ms.handle(path, func(w http.ResponseWriter, r *http.Request) {
@@ -354,7 +353,7 @@ func TestClient_PeelSiteIDs(t *testing.T) {
 	}
 
 	c := flowworks.NewClient(ms.URL(), "user", "pass")
-	for _, s := range peelSites {
+	for _, s := range combos {
 		pts, err := c.ChannelData(context.Background(), s.siteID, s.channelID,
 			flowworks.LastN("D", 1))
 		if err != nil {
