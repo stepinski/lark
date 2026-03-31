@@ -19,8 +19,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
+	"math"
 	"net/url"
 	"strconv"
 	"sync"
@@ -28,6 +28,8 @@ import (
 )
 
 const (
+	// maxPointsPerRequest is the FlowWorks documented response size cap.
+	maxPointsPerRequest = 1_500_000
 	// tokenRefreshMargin is how early we refresh before expiry.
 	tokenRefreshMargin = 5 * time.Minute
 	// defaultTimeout for individual HTTP requests.
@@ -49,14 +51,14 @@ type apiResponse[T any] struct {
 // --- Auth types ---
 
 type tokenRequest struct {
-	UserName string `json:"UserName"`
+	UserName string `json:"Username"`
 	Password string `json:"Password"`
 }
 
 type tokenResponse struct {
-	Token    string `json:"Token"`
-	IssuedAt string `json:"IssuedAt"`
-	Expires  string `json:"Expires"`
+	Token     string `json:"Token"`
+	IssuedAt  string `json:"IssuedAt"`
+	Expires   string `json:"Expires"`
 }
 
 // --- Domain types ---
@@ -74,16 +76,22 @@ type DataPoint struct {
 
 // Site is a FlowWorks monitoring site.
 type Site struct {
-	SiteID   int    `json:"SiteId"`
-	SiteName string `json:"SiteName"`
-	SiteType string `json:"SiteType"`
+	SiteID        int      `json:"Id"`
+	SiteName      string   `json:"Name"`
+	InternalName  string   `json:"InternalName"`
+	Longitude     string   `json:"Longitude"`
+	Latitude      string   `json:"Latitude"`
+	SiteTypes     []string `json:"SiteTypes"`
 }
 
 // Channel is a data channel within a site.
 type Channel struct {
-	ChannelID   int    `json:"ChannelId"`
-	ChannelName string `json:"ChannelName"`
-	Units       string `json:"Units"`
+	ChannelID          int    `json:"Id"`
+	ChannelName        string `json:"Name"`
+	Units              string `json:"Unit"`
+	ChannelType        string `json:"ChannelType"`
+	IsVisible          bool   `json:"IsVisible"`
+	IsRainfallEnabled  bool   `json:"IsRainfallEnabled"`
 }
 
 // --- Query options ---
@@ -140,6 +148,12 @@ func NewClient(baseURL, username, password string) *Client {
 		password: password,
 		httpClient: &http.Client{
 			Timeout: defaultTimeout,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				if len(via) >= 10 {
+					return fmt.Errorf("flowworks: too many redirects")
+				}
+				return nil
+			},
 		},
 	}
 }
@@ -177,11 +191,7 @@ func (c *Client) authenticate(ctx context.Context) error {
 		return fmt.Errorf("flowworks: decode auth response: %w", err)
 	}
 
-	expiry, err := time.Parse("2006-01-02 15:04:05.000", tr.Expires)
-	if err != nil {
-		// fallback: assume 60 minute validity
-		expiry = time.Now().UTC().Add(60 * time.Minute)
-	}
+	expiry := parseExpiry(tr.Expires)
 
 	c.mu.Lock()
 	c.token = tr.Token
@@ -436,6 +446,25 @@ func parseFlexDate(s string) (time.Time, error) {
 		}
 	}
 	return time.Time{}, fmt.Errorf("unrecognised date format %q", s)
+}
+
+
+
+// parseExpiry parses the FlowWorks token expiry string.
+// The API returns "2006-01-02 15:04:05.000Z" (with Z suffix).
+// Falls back to 60-minute validity if parsing fails.
+func parseExpiry(s string) time.Time {
+	for _, layout := range []string{
+		"2006-01-02 15:04:05.000Z",
+		"2006-01-02 15:04:05.000",
+		"2006-01-02 15:04:05Z",
+		"2006-01-02 15:04:05",
+	} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t.UTC()
+		}
+	}
+	return time.Now().UTC().Add(60 * time.Minute)
 }
 
 // MultiError aggregates multiple channel fetch errors.
