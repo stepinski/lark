@@ -1,17 +1,10 @@
-# Binaries
-lark
-main
-*.exe
-
-# Models and Data
-models/*.onnx
-data/*.csv
-data/*.json
-
-# IDEs
-.idea/
-.vscode/
-
-# Go
-vendor/
-go.sum
+bin/
+cmd/fwfetch/fwfetch
+cmd/lark/lark
+.env
+*.env
+env.sh
+*.test
+*.out
+files.zip
+.DS_Store
