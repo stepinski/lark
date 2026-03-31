@@ -283,9 +283,9 @@ func TestClient_SiteChannels(t *testing.T) {
 	ms.handle("/sites/1/channels", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]interface{}{
 			"Resources": []map[string]interface{}{
-				{"ChannelId": 10, "ChannelName": "Depth", "Units": "m"},
-				{"ChannelId": 11, "ChannelName": "Rainfall", "Units": "mm"},
-				{"ChannelId": 12, "ChannelName": "Switch", "Units": ""},
+				{"Id": 10, "Name": "Depth", "Unit": "m"},
+				{"Id": 11, "Name": "Rainfall", "Unit": "mm"},
+				{"Id": 12, "Name": "Switch", "Unit": ""},
 			},
 			"ResultCode": 0, "ResultMessage": "OK",
 		})

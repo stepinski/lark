@@ -49,7 +49,7 @@ type apiResponse[T any] struct {
 // --- Auth types ---
 
 type tokenRequest struct {
-	UserName string `json:"UserName"`
+	UserName string `json:"Username"`
 	Password string `json:"Password"`
 }
 
@@ -74,16 +74,22 @@ type DataPoint struct {
 
 // Site is a FlowWorks monitoring site.
 type Site struct {
-	SiteID   int    `json:"SiteId"`
-	SiteName string `json:"SiteName"`
-	SiteType string `json:"SiteType"`
+	SiteID       int      `json:"Id"`
+	SiteName     string   `json:"Name"`
+	InternalName string   `json:"InternalName"`
+	Longitude    string   `json:"Longitude"`
+	Latitude     string   `json:"Latitude"`
+	SiteTypes    []string `json:"SiteTypes"`
 }
 
 // Channel is a data channel within a site.
 type Channel struct {
-	ChannelID   int    `json:"ChannelId"`
-	ChannelName string `json:"ChannelName"`
-	Units       string `json:"Units"`
+	ChannelID         int    `json:"Id"`
+	ChannelName       string `json:"Name"`
+	Units             string `json:"Unit"`
+	ChannelType       string `json:"ChannelType"`
+	IsVisible         bool   `json:"IsVisible"`
+	IsRainfallEnabled bool   `json:"IsRainfallEnabled"`
 }
 
 // --- Query options ---
@@ -140,6 +146,12 @@ func NewClient(baseURL, username, password string) *Client {
 		password: password,
 		httpClient: &http.Client{
 			Timeout: defaultTimeout,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				if len(via) >= 10 {
+					return fmt.Errorf("flowworks: too many redirects")
+				}
+				return nil
+			},
 		},
 	}
 }
@@ -177,11 +189,7 @@ func (c *Client) authenticate(ctx context.Context) error {
 		return fmt.Errorf("flowworks: decode auth response: %w", err)
 	}
 
-	expiry, err := time.Parse("2006-01-02 15:04:05.000", tr.Expires)
-	if err != nil {
-		// fallback: assume 60 minute validity
-		expiry = time.Now().UTC().Add(60 * time.Minute)
-	}
+	expiry := parseExpiry(tr.Expires)
 
 	c.mu.Lock()
 	c.token = tr.Token
@@ -273,9 +281,26 @@ func (c *Client) SiteChannels(ctx context.Context, siteID int) ([]Channel, error
 }
 
 // rawDataPoint is the wire format from the API.
+// DataTime is returned without timezone (e.g. "2026-03-01T06:35:00")
+// so we unmarshal it as a string and parse manually.
 type rawDataPoint struct {
-	DataValue string    `json:"DataValue"`
-	DataTime  time.Time `json:"DataTime"`
+	DataValue string `json:"DataValue"`
+	DataTime  string `json:"DataTime"`
+}
+
+// parsedTime parses the FlowWorks timestamp which has no timezone suffix.
+// Treated as UTC.
+func parsedTime(s string) time.Time {
+	for _, layout := range []string{
+		"2006-01-02T15:04:05",
+		"2006-01-02T15:04:05Z",
+		time.RFC3339,
+	} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t.UTC()
+		}
+	}
+	return time.Time{}
 }
 
 // ChannelData fetches data points for a single channel.
@@ -373,7 +398,7 @@ func (c *Client) fetchChunk(ctx context.Context, siteID, channelID int, p *query
 	for _, r := range resp.Resources {
 		v, err := strconv.ParseFloat(r.DataValue, 64)
 		dp := DataPoint{
-			Time: r.DataTime.UTC(),
+			Time: parsedTime(r.DataTime),
 			Raw:  r.DataValue,
 		}
 		if err == nil {
@@ -436,6 +461,23 @@ func parseFlexDate(s string) (time.Time, error) {
 		}
 	}
 	return time.Time{}, fmt.Errorf("unrecognised date format %q", s)
+}
+
+// parseExpiry parses the FlowWorks token expiry string.
+// The API returns "2006-01-02 15:04:05.000Z" (with Z suffix).
+// Falls back to 60-minute validity if parsing fails.
+func parseExpiry(s string) time.Time {
+	for _, layout := range []string{
+		"2006-01-02 15:04:05.000Z",
+		"2006-01-02 15:04:05.000",
+		"2006-01-02 15:04:05Z",
+		"2006-01-02 15:04:05",
+	} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t.UTC()
+		}
+	}
+	return time.Now().UTC().Add(60 * time.Minute)
 }
 
 // MultiError aggregates multiple channel fetch errors.

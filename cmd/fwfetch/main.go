@@ -2,19 +2,20 @@
 //
 // Usage:
 //
-//	go run ./cmd/fwfetch -user USER -pass PASS -site 241 -channels 36843,21881,36451
-//	go run ./cmd/fwfetch -user USER -pass PASS -site 241 -channels 36843 -days 365
-//	go run ./cmd/fwfetch -user USER -pass PASS -site 241 -channels 36843 -start 2022-01-01 -end 2024-01-01
+//	go run ./cmd/fwfetch -list-sites
+//	go run ./cmd/fwfetch -site 241 -list-channels
+//	go run ./cmd/fwfetch -site 241 -channels 10,11,12 -days 30
+//	go run ./cmd/fwfetch -site 241 -channels 10,11 -start 2024-01-01 -end 2026-01-01 -csv output.csv
 //
-// Credentials can also be provided via environment variables:
+// Credentials via environment variables:
 //
 //	export FW_USER=your_username
 //	export FW_PASS=your_password
-//	go run ./cmd/fwfetch -site 241 -channels 36843,21881
 package main
 
 import (
 	"context"
+	"encoding/csv"
 	"flag"
 	"fmt"
 	"log"
@@ -28,43 +29,44 @@ import (
 )
 
 func main() {
-	user := flag.String("user", os.Getenv("FW_USER"), "FlowWorks username (or FW_USER env)")
-	pass := flag.String("pass", os.Getenv("FW_PASS"), "FlowWorks password (or FW_PASS env)")
-	baseURL := flag.String("url", "https://developers.flowworks.com/fwapi/v2", "FlowWorks API base URL")
-	siteID := flag.Int("site", 0, "Site ID to fetch (required)")
-	channelList := flag.String("channels", "", "Comma-separated channel IDs, e.g. 36843,21881,36451 (required)")
-	days := flag.Int("days", 30, "Number of recent days to fetch (ignored if -start/-end provided)")
-	start := flag.String("start", "", "Start date: yyyy-MM-dd or yyyy-MM-ddTHH:mm:ss")
-	end := flag.String("end", "", "End date: yyyy-MM-dd or yyyy-MM-ddTHH:mm:ss")
-	listSites := flag.Bool("list-sites", false, "List all visible sites and exit")
-	listChannels := flag.Bool("list-channels", false, "List all channels for -site and exit")
+	user        := flag.String("user", os.Getenv("FW_USER"), "FlowWorks username (or FW_USER env)")
+	pass        := flag.String("pass", os.Getenv("FW_PASS"), "FlowWorks password (or FW_PASS env)")
+	baseURL     := flag.String("url", "https://developers.flowworks.com/fwapi/v2", "FlowWorks API base URL")
+	siteID      := flag.Int("site", 0, "Site ID")
+	channelList := flag.String("channels", "", "Comma-separated channel IDs, e.g. 10,11,12")
+	days        := flag.Int("days", 30, "Number of recent days to fetch")
+	start       := flag.String("start", "", "Start date: yyyy-MM-dd")
+	end         := flag.String("end", "", "End date: yyyy-MM-dd")
+	csvOut      := flag.String("csv", "", "Write output to CSV file (e.g. output.csv)")
+	listSites   := flag.Bool("list-sites", false, "List all visible sites and exit")
+	listChans   := flag.Bool("list-channels", false, "List all channels for -site and exit")
 	flag.Parse()
 
 	if *user == "" || *pass == "" {
 		log.Fatal("credentials required: -user / -pass flags or FW_USER / FW_PASS env vars")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 
 	c := flowworks.NewClient(*baseURL, *user, *pass)
 
-	// --- list sites mode ---
+	// --- list sites ---
 	if *listSites {
 		sites, err := c.Sites(ctx)
 		if err != nil {
 			log.Fatalf("sites error: %v", err)
 		}
-		fmt.Printf("%-8s %-40s %s\n", "ID", "Name", "Type")
+		fmt.Printf("%-8s %-40s %s\n", "ID", "Name", "Types")
 		fmt.Println(strings.Repeat("-", 70))
 		for _, s := range sites {
-			fmt.Printf("%-8d %-40s %s\n", s.SiteID, s.SiteName, s.SiteType)
+			fmt.Printf("%-8d %-40s %s\n", s.SiteID, s.SiteName, strings.Join(s.SiteTypes, ","))
 		}
 		return
 	}
 
-	// --- list channels mode ---
-	if *listChannels {
+	// --- list channels ---
+	if *listChans {
 		if *siteID == 0 {
 			log.Fatal("-site required with -list-channels")
 		}
@@ -72,25 +74,25 @@ func main() {
 		if err != nil {
 			log.Fatalf("channels error: %v", err)
 		}
-		fmt.Printf("%-8s %-40s %s\n", "ID", "Name", "Units")
-		fmt.Println(strings.Repeat("-", 60))
+		fmt.Printf("%-8s %-40s %-8s %s\n", "ID", "Name", "Units", "Type")
+		fmt.Println(strings.Repeat("-", 70))
 		for _, ch := range channels {
-			fmt.Printf("%-8d %-40s %s\n", ch.ChannelID, ch.ChannelName, ch.Units)
+			fmt.Printf("%-8d %-40s %-8s %s\n", ch.ChannelID, ch.ChannelName, ch.Units, ch.ChannelType)
 		}
 		return
 	}
 
-	// --- data fetch mode ---
+	// --- fetch data ---
 	if *siteID == 0 {
 		log.Fatal("-site required")
 	}
 	if *channelList == "" {
-		log.Fatal("-channels required, e.g. -channels 36843,21881,36451")
+		log.Fatal("-channels required, e.g. -channels 10,11,12")
 	}
 
 	channelIDs, err := parseChannelIDs(*channelList)
 	if err != nil {
-		log.Fatalf("invalid -channels value: %v", err)
+		log.Fatalf("invalid -channels: %v", err)
 	}
 
 	var opt flowworks.QueryOption
@@ -100,31 +102,104 @@ func main() {
 		opt = flowworks.LastN("D", *days)
 	}
 
-	fmt.Printf("→ fetching site %d, channels %v\n", *siteID, channelIDs)
+	fmt.Fprintf(os.Stderr, "→ fetching site %d, channels %v\n", *siteID, channelIDs)
 
 	data, err := c.MultiChannelData(ctx, *siteID, channelIDs, opt)
 	if err != nil {
 		log.Fatalf("fetch error: %v", err)
 	}
 
-	fmt.Printf("\n%-12s %-8s %-10s %-10s %-10s %-10s %s\n",
+	// --- print summary to stderr always ---
+	fmt.Fprintf(os.Stderr, "\n%-12s %-8s %-10s %-10s %-10s %-10s %s\n",
 		"Channel", "Points", "Min", "Max", "Mean", "NaN", "First timestamp")
-	fmt.Println(strings.Repeat("-", 75))
-
+	fmt.Fprintln(os.Stderr, strings.Repeat("-", 75))
 	for _, id := range channelIDs {
-		pts, ok := data[id]
-		if !ok {
-			fmt.Printf("%-12d %-8s\n", id, "ERROR")
-			continue
-		}
+		pts := data[id]
 		s := computeStats(pts)
 		first := ""
 		if len(pts) > 0 {
 			first = pts[0].Time.Format("2006-01-02 15:04")
 		}
-		fmt.Printf("%-12d %-8d %-10.3f %-10.3f %-10.3f %-10d %s\n",
+		fmt.Fprintf(os.Stderr, "%-12d %-8d %-10.3f %-10.3f %-10.3f %-10d %s\n",
 			id, len(pts), s.min, s.max, s.mean, s.nanCount, first)
 	}
+
+	// --- CSV output ---
+	if *csvOut != "" {
+		if err := writeCSV(*csvOut, channelIDs, data); err != nil {
+			log.Fatalf("csv write error: %v", err)
+		}
+		fmt.Fprintf(os.Stderr, "\n✓ wrote %s\n", *csvOut)
+	}
+}
+
+// writeCSV writes all channels into a single CSV with columns:
+// timestamp, channel_<id1>, channel_<id2>, ...
+// Timestamps are aligned — missing values for a channel at a given
+// timestamp are written as empty string.
+func writeCSV(path string, channelIDs []int, data map[int][]flowworks.DataPoint) error {
+	// build unified sorted timestamp index
+	tsSet := make(map[int64]struct{})
+	for _, pts := range data {
+		for _, p := range pts {
+			tsSet[p.Time.Unix()] = struct{}{}
+		}
+	}
+	timestamps := make([]int64, 0, len(tsSet))
+	for ts := range tsSet {
+		timestamps = append(timestamps, ts)
+	}
+	// sort timestamps
+	for i := 1; i < len(timestamps); i++ {
+		for j := i; j > 0 && timestamps[j] < timestamps[j-1]; j-- {
+			timestamps[j], timestamps[j-1] = timestamps[j-1], timestamps[j]
+		}
+	}
+
+	// build lookup: channelID -> timestamp -> value
+	lookup := make(map[int]map[int64]string, len(channelIDs))
+	for _, id := range channelIDs {
+		lookup[id] = make(map[int64]string, len(data[id]))
+		for _, p := range data[id] {
+			if math.IsNaN(p.Value) {
+				lookup[id][p.Time.Unix()] = ""
+			} else {
+				lookup[id][p.Time.Unix()] = strconv.FormatFloat(p.Value, 'f', 4, 64)
+			}
+		}
+	}
+
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	w := csv.NewWriter(f)
+
+	// header
+	header := []string{"timestamp"}
+	for _, id := range channelIDs {
+		header = append(header, fmt.Sprintf("ch_%d", id))
+	}
+	if err := w.Write(header); err != nil {
+		return err
+	}
+
+	// rows
+	for _, ts := range timestamps {
+		row := []string{time.Unix(ts, 0).UTC().Format("2006-01-02T15:04:05Z")}
+		for _, id := range channelIDs {
+			v := lookup[id][ts]
+			row = append(row, v)
+		}
+		if err := w.Write(row); err != nil {
+			return err
+		}
+	}
+
+	w.Flush()
+	return w.Error()
 }
 
 func parseChannelIDs(s string) ([]int, error) {
@@ -142,7 +217,7 @@ func parseChannelIDs(s string) ([]int, error) {
 		ids = append(ids, id)
 	}
 	if len(ids) == 0 {
-		return nil, fmt.Errorf("no valid channel IDs found in %q", s)
+		return nil, fmt.Errorf("no valid channel IDs in %q", s)
 	}
 	return ids, nil
 }
