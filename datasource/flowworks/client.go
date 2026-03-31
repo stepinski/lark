@@ -283,9 +283,26 @@ func (c *Client) SiteChannels(ctx context.Context, siteID int) ([]Channel, error
 }
 
 // rawDataPoint is the wire format from the API.
+// DataTime is returned without timezone (e.g. "2026-03-01T06:35:00")
+// so we unmarshal it as a string and parse manually.
 type rawDataPoint struct {
-	DataValue string    `json:"DataValue"`
-	DataTime  time.Time `json:"DataTime"`
+	DataValue string `json:"DataValue"`
+	DataTime  string `json:"DataTime"`
+}
+
+// parsedTime parses the FlowWorks timestamp which has no timezone suffix.
+// Treated as UTC.
+func parsedTime(s string) time.Time {
+	for _, layout := range []string{
+		"2006-01-02T15:04:05",
+		"2006-01-02T15:04:05Z",
+		time.RFC3339,
+	} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t.UTC()
+		}
+	}
+	return time.Time{}
 }
 
 // ChannelData fetches data points for a single channel.
@@ -383,7 +400,7 @@ func (c *Client) fetchChunk(ctx context.Context, siteID, channelID int, p *query
 	for _, r := range resp.Resources {
 		v, err := strconv.ParseFloat(r.DataValue, 64)
 		dp := DataPoint{
-			Time: r.DataTime.UTC(),
+			Time: parsedTime(r.DataTime),
 			Raw:  r.DataValue,
 		}
 		if err == nil {

@@ -5,7 +5,7 @@
 //	go run ./cmd/fwfetch -list-sites
 //	go run ./cmd/fwfetch -site 241 -list-channels
 //	go run ./cmd/fwfetch -site 241 -channels 10,11,12 -days 30
-//	go run ./cmd/fwfetch -site 241 -channels 10 -start 2022-01-01 -end 2024-01-01
+//	go run ./cmd/fwfetch -site 241 -channels 10,11 -start 2024-01-01 -end 2026-01-01 -csv output.csv
 //
 // Credentials via environment variables:
 //
@@ -15,6 +15,7 @@ package main
 
 import (
 	"context"
+	"encoding/csv"
 	"flag"
 	"fmt"
 	"log"
@@ -36,6 +37,7 @@ func main() {
 	days        := flag.Int("days", 30, "Number of recent days to fetch")
 	start       := flag.String("start", "", "Start date: yyyy-MM-dd")
 	end         := flag.String("end", "", "End date: yyyy-MM-dd")
+	csvOut      := flag.String("csv", "", "Write output to CSV file (e.g. output.csv)")
 	listSites   := flag.Bool("list-sites", false, "List all visible sites and exit")
 	listChans   := flag.Bool("list-channels", false, "List all channels for -site and exit")
 	flag.Parse()
@@ -44,7 +46,7 @@ func main() {
 		log.Fatal("credentials required: -user / -pass flags or FW_USER / FW_PASS env vars")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 
 	c := flowworks.NewClient(*baseURL, *user, *pass)
@@ -100,31 +102,104 @@ func main() {
 		opt = flowworks.LastN("D", *days)
 	}
 
-	fmt.Printf("→ fetching site %d, channels %v\n", *siteID, channelIDs)
+	fmt.Fprintf(os.Stderr, "→ fetching site %d, channels %v\n", *siteID, channelIDs)
 
 	data, err := c.MultiChannelData(ctx, *siteID, channelIDs, opt)
 	if err != nil {
 		log.Fatalf("fetch error: %v", err)
 	}
 
-	fmt.Printf("\n%-12s %-8s %-10s %-10s %-10s %-10s %s\n",
+	// --- print summary to stderr always ---
+	fmt.Fprintf(os.Stderr, "\n%-12s %-8s %-10s %-10s %-10s %-10s %s\n",
 		"Channel", "Points", "Min", "Max", "Mean", "NaN", "First timestamp")
-	fmt.Println(strings.Repeat("-", 75))
-
+	fmt.Fprintln(os.Stderr, strings.Repeat("-", 75))
 	for _, id := range channelIDs {
-		pts, ok := data[id]
-		if !ok {
-			fmt.Printf("%-12d %-8s\n", id, "ERROR")
-			continue
-		}
+		pts := data[id]
 		s := computeStats(pts)
 		first := ""
 		if len(pts) > 0 {
 			first = pts[0].Time.Format("2006-01-02 15:04")
 		}
-		fmt.Printf("%-12d %-8d %-10.3f %-10.3f %-10.3f %-10d %s\n",
+		fmt.Fprintf(os.Stderr, "%-12d %-8d %-10.3f %-10.3f %-10.3f %-10d %s\n",
 			id, len(pts), s.min, s.max, s.mean, s.nanCount, first)
 	}
+
+	// --- CSV output ---
+	if *csvOut != "" {
+		if err := writeCSV(*csvOut, channelIDs, data); err != nil {
+			log.Fatalf("csv write error: %v", err)
+		}
+		fmt.Fprintf(os.Stderr, "\n✓ wrote %s\n", *csvOut)
+	}
+}
+
+// writeCSV writes all channels into a single CSV with columns:
+// timestamp, channel_<id1>, channel_<id2>, ...
+// Timestamps are aligned — missing values for a channel at a given
+// timestamp are written as empty string.
+func writeCSV(path string, channelIDs []int, data map[int][]flowworks.DataPoint) error {
+	// build unified sorted timestamp index
+	tsSet := make(map[int64]struct{})
+	for _, pts := range data {
+		for _, p := range pts {
+			tsSet[p.Time.Unix()] = struct{}{}
+		}
+	}
+	timestamps := make([]int64, 0, len(tsSet))
+	for ts := range tsSet {
+		timestamps = append(timestamps, ts)
+	}
+	// sort timestamps
+	for i := 1; i < len(timestamps); i++ {
+		for j := i; j > 0 && timestamps[j] < timestamps[j-1]; j-- {
+			timestamps[j], timestamps[j-1] = timestamps[j-1], timestamps[j]
+		}
+	}
+
+	// build lookup: channelID -> timestamp -> value
+	lookup := make(map[int]map[int64]string, len(channelIDs))
+	for _, id := range channelIDs {
+		lookup[id] = make(map[int64]string, len(data[id]))
+		for _, p := range data[id] {
+			if math.IsNaN(p.Value) {
+				lookup[id][p.Time.Unix()] = ""
+			} else {
+				lookup[id][p.Time.Unix()] = strconv.FormatFloat(p.Value, 'f', 4, 64)
+			}
+		}
+	}
+
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	w := csv.NewWriter(f)
+
+	// header
+	header := []string{"timestamp"}
+	for _, id := range channelIDs {
+		header = append(header, fmt.Sprintf("ch_%d", id))
+	}
+	if err := w.Write(header); err != nil {
+		return err
+	}
+
+	// rows
+	for _, ts := range timestamps {
+		row := []string{time.Unix(ts, 0).UTC().Format("2006-01-02T15:04:05Z")}
+		for _, id := range channelIDs {
+			v := lookup[id][ts]
+			row = append(row, v)
+		}
+		if err := w.Write(row); err != nil {
+			return err
+		}
+	}
+
+	w.Flush()
+	return w.Error()
 }
 
 func parseChannelIDs(s string) ([]int, error) {
