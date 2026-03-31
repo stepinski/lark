@@ -1,9 +1,9 @@
 package flowworks_test
 
 import (
-	"fmt"
 	"context"
 	"encoding/json"
+	"fmt"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/skete-io/lark/datasource/flowworks"
+	"github.com/stepinski/lark/datasource/flowworks"
 )
 
 // --- test server helpers ---
@@ -27,9 +27,8 @@ func newMockServer() *mockServer {
 	return &mockServer{mux: mux, server: s}
 }
 
-func (m *mockServer) Close() { m.server.Close() }
+func (m *mockServer) Close()      { m.server.Close() }
 func (m *mockServer) URL() string { return m.server.URL }
-
 func (m *mockServer) handle(pattern string, fn http.HandlerFunc) {
 	m.mux.HandleFunc(pattern, fn)
 }
@@ -47,12 +46,11 @@ func authHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// --- tests ---
+// --- auth tests ---
 
 func TestClient_Authenticate(t *testing.T) {
 	ms := newMockServer()
 	defer ms.Close()
-
 	ms.handle("/authenticate", authHandler)
 	ms.handle("/sites", func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer test-token-abc" {
@@ -60,9 +58,7 @@ func TestClient_Authenticate(t *testing.T) {
 			return
 		}
 		writeJSON(w, map[string]interface{}{
-			"Resources":     []interface{}{},
-			"ResultCode":    0,
-			"ResultMessage": "OK",
+			"Resources": []interface{}{}, "ResultCode": 0, "ResultMessage": "OK",
 		})
 	})
 
@@ -90,7 +86,6 @@ func TestClient_TokenRefreshOn401(t *testing.T) {
 	var siteCalls atomic.Int32
 	ms.handle("/sites", func(w http.ResponseWriter, r *http.Request) {
 		n := siteCalls.Add(1)
-		// first call returns 401 to trigger refresh
 		if n == 1 {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
@@ -113,12 +108,13 @@ func TestClient_TokenRefreshOn401(t *testing.T) {
 	}
 }
 
+// --- channel data tests ---
+
 func TestClient_ChannelData_ParsesFloat(t *testing.T) {
 	ms := newMockServer()
 	defer ms.Close()
 	ms.handle("/authenticate", authHandler)
-
-	ms.handle("/sites/241/channels/36843/data", func(w http.ResponseWriter, r *http.Request) {
+	ms.handle("/sites/1/channels/10/data", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]interface{}{
 			"Resources": []map[string]interface{}{
 				{"DataValue": "1.23", "DataTime": "2024-01-01T08:00:00Z"},
@@ -130,8 +126,7 @@ func TestClient_ChannelData_ParsesFloat(t *testing.T) {
 	})
 
 	c := flowworks.NewClient(ms.URL(), "user", "pass")
-	pts, err := c.ChannelData(context.Background(), 241, 36843,
-		flowworks.LastN("D", 1))
+	pts, err := c.ChannelData(context.Background(), 1, 10, flowworks.LastN("D", 1))
 	if err != nil {
 		t.Fatalf("ChannelData error: %v", err)
 	}
@@ -150,21 +145,19 @@ func TestClient_ChannelData_NonNumericBecomesNaN(t *testing.T) {
 	ms := newMockServer()
 	defer ms.Close()
 	ms.handle("/authenticate", authHandler)
-
-	ms.handle("/sites/241/channels/36451/data", func(w http.ResponseWriter, r *http.Request) {
+	ms.handle("/sites/1/channels/11/data", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]interface{}{
 			"Resources": []map[string]interface{}{
 				{"DataValue": "N/A", "DataTime": "2024-01-01T00:00:00Z"},
-				{"DataValue": "0",   "DataTime": "2024-01-01T00:05:00Z"},
-				{"DataValue": "1",   "DataTime": "2024-01-01T00:10:00Z"},
+				{"DataValue": "0", "DataTime": "2024-01-01T00:05:00Z"},
+				{"DataValue": "1", "DataTime": "2024-01-01T00:10:00Z"},
 			},
 			"ResultCode": 0, "ResultMessage": "OK",
 		})
 	})
 
 	c := flowworks.NewClient(ms.URL(), "user", "pass")
-	pts, err := c.ChannelData(context.Background(), 241, 36451,
-		flowworks.LastN("D", 1))
+	pts, err := c.ChannelData(context.Background(), 1, 11, flowworks.LastN("D", 1))
 	if err != nil {
 		t.Fatalf("ChannelData error: %v", err)
 	}
@@ -181,9 +174,8 @@ func TestClient_ChannelData_Pagination(t *testing.T) {
 	defer ms.Close()
 	ms.handle("/authenticate", authHandler)
 
-	// count how many chunk requests are made
 	var chunkCalls atomic.Int32
-	ms.handle("/sites/241/channels/36843/data", func(w http.ResponseWriter, r *http.Request) {
+	ms.handle("/sites/1/channels/10/data", func(w http.ResponseWriter, r *http.Request) {
 		chunkCalls.Add(1)
 		writeJSON(w, map[string]interface{}{
 			"Resources": []map[string]interface{}{
@@ -195,17 +187,15 @@ func TestClient_ChannelData_Pagination(t *testing.T) {
 
 	c := flowworks.NewClient(ms.URL(), "user", "pass")
 	// 200-day range → should split into 3 chunks (90 + 90 + 20)
-	pts, err := c.ChannelData(context.Background(), 241, 36843,
+	pts, err := c.ChannelData(context.Background(), 1, 10,
 		flowworks.DateRange("2024-01-01", "2024-07-19"))
 	if err != nil {
 		t.Fatalf("ChannelData error: %v", err)
 	}
-
 	n := chunkCalls.Load()
 	if n < 2 {
 		t.Errorf("expected at least 2 chunk requests for 200-day range, got %d", n)
 	}
-	// each chunk returns 1 point, so len(pts) == number of chunks
 	if len(pts) != int(n) {
 		t.Errorf("pts len %d != chunk calls %d", len(pts), n)
 	}
@@ -215,9 +205,7 @@ func TestClient_ChannelData_ContextCancellation(t *testing.T) {
 	ms := newMockServer()
 	defer ms.Close()
 	ms.handle("/authenticate", authHandler)
-
-	// slow handler — should be interrupted by context cancel
-	ms.handle("/sites/241/channels/36843/data", func(w http.ResponseWriter, r *http.Request) {
+	ms.handle("/sites/1/channels/10/data", func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(500 * time.Millisecond)
 		writeJSON(w, map[string]interface{}{
 			"Resources": []interface{}{}, "ResultCode": 0, "ResultMessage": "OK",
@@ -228,7 +216,7 @@ func TestClient_ChannelData_ContextCancellation(t *testing.T) {
 	defer cancel()
 
 	c := flowworks.NewClient(ms.URL(), "user", "pass")
-	_, err := c.ChannelData(ctx, 241, 36843, flowworks.LastN("D", 1))
+	_, err := c.ChannelData(ctx, 1, 10, flowworks.LastN("D", 1))
 	if err == nil {
 		t.Error("expected error on context timeout, got nil")
 	}
@@ -239,9 +227,9 @@ func TestClient_MultiChannelData_AllChannels(t *testing.T) {
 	defer ms.Close()
 	ms.handle("/authenticate", authHandler)
 
-	for _, cid := range []string{"36843", "21881", "36451"} {
-		id := cid // capture
-		ms.handle("/sites/241/channels/"+id+"/data", func(w http.ResponseWriter, r *http.Request) {
+	for _, cid := range []string{"10", "11", "12"} {
+		id := cid
+		ms.handle("/sites/1/channels/"+id+"/data", func(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, map[string]interface{}{
 				"Resources": []map[string]interface{}{
 					{"DataValue": "2.5", "DataTime": "2024-06-01T00:00:00Z"},
@@ -252,12 +240,12 @@ func TestClient_MultiChannelData_AllChannels(t *testing.T) {
 	}
 
 	c := flowworks.NewClient(ms.URL(), "user", "pass")
-	result, err := c.MultiChannelData(context.Background(), 241,
-		[]int{36843, 21881, 36451}, flowworks.LastN("D", 30))
+	result, err := c.MultiChannelData(context.Background(), 1,
+		[]int{10, 11, 12}, flowworks.LastN("D", 30))
 	if err != nil {
 		t.Fatalf("MultiChannelData error: %v", err)
 	}
-	for _, cid := range []int{36843, 21881, 36451} {
+	for _, cid := range []int{10, 11, 12} {
 		pts, ok := result[cid]
 		if !ok {
 			t.Errorf("missing channel %d in result", cid)
@@ -273,8 +261,7 @@ func TestClient_APIError_NonZeroResultCode(t *testing.T) {
 	ms := newMockServer()
 	defer ms.Close()
 	ms.handle("/authenticate", authHandler)
-
-	ms.handle("/sites/241/channels/99999/data", func(w http.ResponseWriter, r *http.Request) {
+	ms.handle("/sites/1/channels/99/data", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]interface{}{
 			"Resources":     nil,
 			"ResultCode":    5,
@@ -283,7 +270,7 @@ func TestClient_APIError_NonZeroResultCode(t *testing.T) {
 	})
 
 	c := flowworks.NewClient(ms.URL(), "user", "pass")
-	_, err := c.ChannelData(context.Background(), 241, 99999, flowworks.LastN("D", 1))
+	_, err := c.ChannelData(context.Background(), 1, 99, flowworks.LastN("D", 1))
 	if err == nil {
 		t.Error("expected error for non-zero ResultCode")
 	}
@@ -293,13 +280,12 @@ func TestClient_SiteChannels(t *testing.T) {
 	ms := newMockServer()
 	defer ms.Close()
 	ms.handle("/authenticate", authHandler)
-
 	ms.handle("/sites/1/channels", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]interface{}{
 			"Resources": []map[string]interface{}{
-				{"ChannelId": 1, "ChannelName": "Depth",    "Units": "m"},
-				{"ChannelId": 2, "ChannelName": "Rainfall", "Units": "mm"},
-				{"ChannelId": 3, "ChannelName": "Float",    "Units": ""},
+				{"ChannelId": 10, "ChannelName": "Depth", "Units": "m"},
+				{"ChannelId": 11, "ChannelName": "Rainfall", "Units": "mm"},
+				{"ChannelId": 12, "ChannelName": "Switch", "Units": ""},
 			},
 			"ResultCode": 0, "ResultMessage": "OK",
 		})
@@ -318,7 +304,7 @@ func TestClient_SiteChannels(t *testing.T) {
 	}
 }
 
-// TestClient_MultiSiteRouting verifies that requests are correctly routed
+// TestClient_MultiSiteRouting verifies requests are correctly routed
 // to different site/channel combinations.
 func TestClient_MultiSiteRouting(t *testing.T) {
 	combos := []struct {
