@@ -19,8 +19,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/http"
 	"math"
+	"net/http"
 	"net/url"
 	"strconv"
 	"sync"
@@ -28,8 +28,6 @@ import (
 )
 
 const (
-	// maxPointsPerRequest is the FlowWorks documented response size cap.
-	maxPointsPerRequest = 1_500_000
 	// tokenRefreshMargin is how early we refresh before expiry.
 	tokenRefreshMargin = 5 * time.Minute
 	// defaultTimeout for individual HTTP requests.
@@ -56,9 +54,9 @@ type tokenRequest struct {
 }
 
 type tokenResponse struct {
-	Token     string `json:"Token"`
-	IssuedAt  string `json:"IssuedAt"`
-	Expires   string `json:"Expires"`
+	Token    string `json:"Token"`
+	IssuedAt string `json:"IssuedAt"`
+	Expires  string `json:"Expires"`
 }
 
 // --- Domain types ---
@@ -439,8 +437,6 @@ func parseFlexDate(s string) (time.Time, error) {
 	}
 	return time.Time{}, fmt.Errorf("unrecognised date format %q", s)
 }
-
-
 
 // MultiError aggregates multiple channel fetch errors.
 type MultiError struct {
