@@ -1,0 +1,33 @@
+bin/
+cmd/fwfetch/fwfetch
+cmd/lark/lark
+.env
+*.env
+env.sh
+*.test
+*.out
+files.zip
+.DS_Store
+LARK.md
+AGENTS.md
+docs/decisions/ADR-005-flowworks-client.md
+# compiled binaries
+evaluate
+predict
+serve
+
+# generated data
+data/forecast.csv
+
+# agent scratchpad
+*_summary.md
+*_fix.md
+*_implementation*.md
+*_verification*.md
+IMPLEMENTATION_*.md
+comprehensive_*.md
+final_*.md
+upstream_*.md
+last_*.md
+localhost+1*.pem
+evaluate

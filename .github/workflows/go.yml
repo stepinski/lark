@@ -1,0 +1,31 @@
+name: Lark CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.23' # Matches your local environment
+        cache: true        # Speeds up subsequent runs by caching dependencies
+
+    - name: Install dependencies
+      run: go mod tidy
+
+    - name: Run Linter
+      # Using golangci-lint is the industry standard for Go
+      uses: golangci/golangci-lint-action@v6
+      with:
+        version: latest
+
+    - name: Run Tests
+      run: go test -v -race ./... # -race checks for concurrency bugs!
